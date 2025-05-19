@@ -1,0 +1,308 @@
+// receiverESP8266 - ESP-NOW PPM + WebSocket Serial Bridge (Improved for MAVLink)
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WebSocketsServer.h>
+#include <Hash.h>
+
+extern "C" {
+    #include <espnow.h>
+    #include <user_interface.h>
+}
+
+// --- Pin Definitions & Constants ---
+#define sigPin 5       // PPM signal output pin (D1 on NodeMCU/Wemos)
+#define DEBUGPIN 4     // Debug pin (D2 on NodeMCU/Wemos) - Optional
+#define WIFI_CHANNEL 1 // Must match sender's channel
+#define CHANNEL_NUMBER 8
+#define CHANNEL_DEFAULT_VALUE 900 // Default servo value (e.g., low throttle for safety)
+
+// --- PPM Timing ---
+#define CPU_MHZ 80
+#define FRAME_LENGTH 22500 // microseconds (22.5 ms)
+#define PULSE_LENGTH 300   // microseconds
+#define onState 0          // Polarity of pulses: 0 is negative (normal for RC)
+
+// --- Serial Bridge Settings ---
+#define SERIAL_BAUD 57600       // Baud rate for Hardware Serial (connected to FC)
+#define BRIDGE_BUFFER_SIZE 256  // Reduced buffer size for MAVLink packets
+
+// --- WiFi AP & Server Settings ---
+const char *ssid = "WebSocketPPM_Bridge";
+const char *password = "websocket123";    // Ensure 8+ characters
+IPAddress apIP(192, 168, 4, 1);
+IPAddress subnet(255, 255, 255, 0);
+#define HTTP_PORT 80
+#define WEBSOCKET_PORT 81
+
+// --- ESP-NOW ---
+uint8_t mac[] = {0x36, 0x33, 0x33, 0x33, 0x33, 0x33}; // This ESP's MAC (Receiver)
+
+struct __attribute__((packed)) PPM_DATA {
+    uint8_t start;
+    uint16_t channels[CHANNEL_NUMBER];
+    uint8_t end;
+} ppmData;
+
+// --- Global Variables ---
+uint16_t ppm[CHANNEL_NUMBER];
+volatile unsigned long next_ppm_pulse_time;
+
+// ESP-NOW Status
+volatile bool esp_now_received = false;
+unsigned long last_esp_now_packet_time = 0;
+#define ESP_NOW_FAILSAFE_TIMEOUT 500
+
+// Web Server & WebSocket Server
+ESP8266WebServer server(HTTP_PORT);
+WebSocketsServer webSocket = WebSocketsServer(WEBSOCKET_PORT);
+int8_t webSocketClientNum = -1;
+
+// Buffer for serial data
+uint8_t serialBuffer[BRIDGE_BUFFER_SIZE];
+
+//============= ESP-NOW Functions =============
+
+void receiveCallBackFunction(uint8_t *senderMac, uint8_t *incomingData, uint8_t len) {
+    if (len >= sizeof(ppmData.channels)) {
+        memcpy(&ppmData, incomingData, sizeof(ppmData));
+        esp_now_received = true;
+        last_esp_now_packet_time = millis();
+    }
+}
+
+bool initEspNow() {
+    WiFi.mode(WIFI_AP_STA);
+    wifi_set_macaddr(SOFTAP_IF, &mac[0]);
+    Serial.print("AP MAC Address: "); Serial.println(WiFi.softAPmacAddress());
+
+    WiFi.setOutputPower(20.5);
+
+    if (esp_now_init() != 0) {
+        Serial.println("!!! ESP-NOW Init Failed");
+        return false;
+    }
+
+    esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+    esp_now_register_recv_cb(receiveCallBackFunction);
+    Serial.println("ESP-NOW Initialized as Slave (Receiver)");
+    return true;
+}
+
+//============= PPM Generation ISR =============
+
+void IRAM_ATTR ppmISR() {
+    static boolean state = true;
+    static byte cur_chan_numb = 0;
+    static unsigned int calc_rest = 0;
+
+    if (state) {
+        digitalWrite(sigPin, onState);
+        next_ppm_pulse_time += (PULSE_LENGTH * CPU_MHZ);
+        state = false;
+    } else {
+        digitalWrite(sigPin, !onState);
+        state = true;
+
+        if (cur_chan_numb >= CHANNEL_NUMBER) {
+            cur_chan_numb = 0;
+            calc_rest += PULSE_LENGTH;
+            next_ppm_pulse_time += ((FRAME_LENGTH - calc_rest) * CPU_MHZ);
+            calc_rest = 0;
+        } else {
+            uint16_t current_channel_us = constrain(ppm[cur_chan_numb], 800, 2200);
+            next_ppm_pulse_time += ((current_channel_us - PULSE_LENGTH) * CPU_MHZ);
+            calc_rest += current_channel_us;
+            cur_chan_numb++;
+        }
+    }
+    timer0_write(ESP.getCycleCount() + next_ppm_pulse_time);
+}
+
+//============= WebSocket Bridge Functions =============
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    switch(type) {
+        case WStype_DISCONNECTED:
+            Serial.printf("[%u] WebSocket Disconnected!\n", num);
+            if (num == webSocketClientNum) {
+                webSocketClientNum = -1;
+            }
+            break;
+
+        case WStype_CONNECTED: {
+            IPAddress ip = webSocket.remoteIP(num);
+            Serial.printf("[%u] WebSocket Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+            webSocketClientNum = num;
+            
+            // Send a simple confirmation
+            webSocket.sendTXT(num, "Bridge Ready");
+            }
+            break;
+
+        case WStype_TEXT:
+            Serial.printf("[%u] Received Text: %s\n", num, payload);
+            break;
+
+        case WStype_BIN:
+            // Forward binary data from WebSocket to Serial (MAVLink commands to Pixhawk)
+            if (length > 0 && length <= BRIDGE_BUFFER_SIZE) {
+                Serial.write(payload, length);
+                Serial.flush(); // Ensure immediate transmission
+            }
+            break;
+
+        case WStype_ERROR:
+            Serial.printf("[%u] WebSocket Error!\n", num);
+            break;
+            
+        default:
+            break;
+    }
+}
+
+void forwardSerialToWebSocket() {
+    if (webSocketClientNum == -1 || !Serial.available()) {
+        return;
+    }
+
+    // Read available serial data
+    size_t len = 0;
+    while (Serial.available() && len < BRIDGE_BUFFER_SIZE) {
+        serialBuffer[len++] = Serial.read();
+        
+        // Small delay to allow more data to arrive
+        if (Serial.available()) {
+            delayMicroseconds(100);
+        }
+    }
+
+    if (len > 0) {
+        // Send as binary WebSocket message
+        webSocket.sendBIN(webSocketClientNum, serialBuffer, len);
+    }
+}
+
+// Improved HTTP handler with CORS headers for web clients
+void handleRoot() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    
+    String html = "<!DOCTYPE html><html><head><title>ESP8266 Bridge</title></head>";
+    html += "<body><h1>WebSocket Serial Bridge</h1>";
+    html += "<p>WebSocket URL: ws://192.168.4.1:81</p>";
+    html += "<p>Status: Ready</p>";
+    html += "<p>Connected Client: " + String(webSocketClientNum >= 0 ? "Yes" : "No") + "</p>";
+    html += "</body></html>";
+    
+    server.send(200, "text/html", html);
+}
+
+// Handle CORS preflight requests
+void handleOptions() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    server.send(200, "text/plain", "");
+}
+
+//============= Setup Function =============
+
+void setup() {
+    pinMode(sigPin, OUTPUT);
+    digitalWrite(sigPin, !onState);
+    #ifdef DEBUGPIN
+    pinMode(DEBUGPIN, OUTPUT);
+    digitalWrite(DEBUGPIN, LOW);
+    #endif
+
+    // Start Hardware Serial
+    Serial.begin(SERIAL_BAUD);
+    Serial.println("\n\nESP8266 WebSocket Serial Bridge");
+    Serial.println("================================");
+
+    // Initialize ESP-NOW
+    if (!initEspNow()) {
+        Serial.println("ESP-NOW failed, continuing without it...");
+    }
+
+    // Initialize WiFi AP with better configuration
+    Serial.printf("Starting AP: %s\n", ssid);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(apIP, apIP, subnet);
+    
+    if (WiFi.softAP(ssid, password, WIFI_CHANNEL, 0, 4)) { // Max 4 clients
+        Serial.printf("AP Started - IP: %s\n", WiFi.softAPIP().toString().c_str());
+        Serial.printf("WebSocket URL: ws://%s:%d\n", WiFi.softAPIP().toString().c_str(), WEBSOCKET_PORT);
+    } else {
+        Serial.println("AP Failed!");
+    }
+
+    // Setup HTTP server with CORS support
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/", HTTP_OPTIONS, handleOptions);
+    server.onNotFound([]() {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(404, "text/plain", "Not Found");
+    });
+    server.begin();
+    Serial.printf("HTTP server on port %d\n", HTTP_PORT);
+
+    // Initialize WebSocket server
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+    webSocket.enableHeartbeat(15000, 3000, 2); // Ping every 15s, timeout 3s, 2 retries
+    Serial.printf("WebSocket server on port %d\n", WEBSOCKET_PORT);
+
+    // Initialize PPM
+    for (int i = 0; i < CHANNEL_NUMBER; i++) {
+        ppm[i] = CHANNEL_DEFAULT_VALUE;
+    }
+    
+    noInterrupts();
+    timer0_isr_init();
+    timer0_attachInterrupt(ppmISR);
+    next_ppm_pulse_time = 1000 * CPU_MHZ;
+    timer0_write(ESP.getCycleCount() + next_ppm_pulse_time);
+    interrupts();
+
+    Serial.println("Setup Complete!");
+    Serial.println("Connect Mission Planner to: ws://192.168.4.1:81");
+    last_esp_now_packet_time = millis();
+}
+
+//============= Main Loop =============
+
+void loop() {
+    // Handle web server and WebSocket
+    server.handleClient();
+    webSocket.loop();
+
+    // Handle ESP-NOW data
+    if (esp_now_received) {
+        noInterrupts();
+        for (char i = 0; i < CHANNEL_NUMBER; i++) {
+            ppm[i] = ppmData.channels[i];
+        }
+        interrupts();
+        esp_now_received = false;
+    }
+
+    // ESP-NOW failsafe
+    if (millis() - last_esp_now_packet_time > ESP_NOW_FAILSAFE_TIMEOUT) {
+        if (ppm[0] != CHANNEL_DEFAULT_VALUE) {
+            noInterrupts();
+            for (int i = 0; i < CHANNEL_NUMBER; i++) {
+                ppm[i] = CHANNEL_DEFAULT_VALUE;
+            }
+            interrupts();
+        }
+        last_esp_now_packet_time = millis();
+    }
+
+    // Forward serial data to WebSocket
+    forwardSerialToWebSocket();
+
+    yield();
+}
